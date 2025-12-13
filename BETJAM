@@ -1,0 +1,294 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+
+contract TimeLockedBetVaultETH {
+    using SafeERC20 for IERC20;
+    using ECDSA for bytes32;
+
+    /*//////////////////////////////////////////////////////////////
+                              ROLES
+    //////////////////////////////////////////////////////////////*/
+
+    address internal constant _BETTOR1 = 0x5df1b9398857148106bb27abd3ab1a30ba298449;
+    address internal constant _BETTOR2 = 0x0000000000000000000000000000000000000000;
+    address internal constant _JUDGE   = 0x0000000000000000000000000000000000000000;
+
+    function BETTOR1() public pure returns (address) { return _BETTOR1; }
+    function BETTOR2() public pure returns (address) { return _BETTOR2; }
+    function JUDGE()   public pure returns (address) { return _JUDGE; }
+
+    /*//////////////////////////////////////////////////////////////
+                              TIME
+    //////////////////////////////////////////////////////////////*/
+
+    uint256 public constant LOCK_UNTIL = 1767225600;              // Jan 1, 2027
+    uint256 public constant SAFETY_WITHDRAWAL_DATE = 1798761600; // Jan 1, 2028
+    uint256 public constant JUDGE_TIMEOUT = 90 days;
+
+    /*//////////////////////////////////////////////////////////////
+                              STATE
+    //////////////////////////////////////////////////////////////*/
+
+    address[] private tokenList;
+    mapping(address => bool) public tokenRegistered;
+    mapping(address => bool) public tokenWithdrawn;
+
+    bool public ethWithdrawn;
+    bool public paused;
+    bool public hasDeposits;
+    uint256 public nonce;
+
+    /*//////////////////////////////////////////////////////////////
+                              EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event TokenRegistered(address token);
+    event TokensDeposited(address indexed from, address indexed token, uint256 amount);
+    event ETHDeposited(address indexed from, uint256 amount);
+    event TokenWithdrawn(address indexed token, address indexed winner, uint256 amount);
+    event ETHWithdrawn(address indexed winner, uint256 amount);
+    event SafetyWithdrawalExecuted();
+    event Paused(bool status);
+
+    /*//////////////////////////////////////////////////////////////
+                              MODIFIERS
+    //////////////////////////////////////////////////////////////*/
+
+    modifier notPaused() {
+        require(!paused, "Paused");
+        _;
+    }
+
+    modifier onlyBettor() {
+        require(msg.sender == BETTOR1() || msg.sender == BETTOR2(), "Only bettors");
+        _;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                              CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+    constructor() {
+        require(BETTOR1() != address(0) && BETTOR2() != address(0) && JUDGE() != address(0), "Unset role");
+        require(BETTOR1() != BETTOR2(), "Same bettor");
+        require(BETTOR1() != JUDGE() && BETTOR2() != JUDGE(), "Role overlap");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                          ADMIN / SAFETY
+    //////////////////////////////////////////////////////////////*/
+
+    function pause(bool _paused) external {
+        require(
+            msg.sender == BETTOR1() || msg.sender == BETTOR2() || msg.sender == JUDGE(),
+            "Unauthorized"
+        );
+        paused = _paused;
+        emit Paused(_paused);
+    }
+
+    function cancelIfUnfunded() external onlyBettor {
+        require(!hasDeposits, "Already funded");
+        selfdestruct(payable(msg.sender));
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                          DEPOSIT (TOKENS)
+    //////////////////////////////////////////////////////////////*/
+
+    function depositToken(address token, uint256 amount)
+        external
+        notPaused
+        onlyBettor
+    {
+        require(token != address(0), "Invalid token");
+        require(amount > 0, "Zero amount");
+
+        if (!tokenRegistered[token]) {
+            tokenRegistered[token] = true;
+            tokenList.push(token);
+            emit TokenRegistered(token);
+        }
+
+        hasDeposits = true;
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+
+        emit TokensDeposited(msg.sender, token, amount);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                          DEPOSIT (ETH)
+    //////////////////////////////////////////////////////////////*/
+
+    function depositETH() external payable notPaused onlyBettor {
+        require(msg.value > 0, "Zero ETH");
+        hasDeposits = true;
+        emit ETHDeposited(msg.sender, msg.value);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    SIGNATURE VERIFICATION (2-of-3)
+    //////////////////////////////////////////////////////////////*/
+
+    function _isValidSigner(address signer) internal pure returns (bool) {
+        return signer == BETTOR1() || signer == BETTOR2() || signer == JUDGE();
+    }
+
+    function _countValidSigners(bytes32 ethHash, bytes[] calldata sigs)
+        internal
+        pure
+        returns (uint256 count)
+    {
+        address[3] memory seen;
+
+        for (uint256 i; i < sigs.length; i++) {
+            address signer = ethHash.recover(sigs[i]);
+            if (_isValidSigner(signer)) {
+                bool duplicate;
+                for (uint256 j; j < count; j++) {
+                    if (seen[j] == signer) duplicate = true;
+                }
+                if (!duplicate) {
+                    seen[count++] = signer;
+                }
+            }
+        }
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        WITHDRAW TOKEN
+    //////////////////////////////////////////////////////////////*/
+
+    function withdrawToken(
+        address token,
+        address winner,
+        bytes[] calldata sigs
+    ) external notPaused {
+        require(block.timestamp >= LOCK_UNTIL, "Locked");
+        require(tokenRegistered[token], "Unknown token");
+        require(!tokenWithdrawn[token], "Already withdrawn");
+        require(winner == BETTOR1() || winner == BETTOR2(), "Invalid winner");
+
+        bytes32 messageHash = keccak256(
+            abi.encode(
+                "withdrawToken",
+                token,
+                winner,
+                address(this),
+                block.chainid,
+                nonce
+            )
+        ).toEthSignedMessageHash();
+
+        uint256 valid = _countValidSigners(messageHash, sigs);
+
+        if (block.timestamp <= LOCK_UNTIL + JUDGE_TIMEOUT) {
+            require(valid >= 2, "Need 2 of 3");
+        } else {
+            require(
+                messageHash.recover(sigs[0]) == BETTOR1() &&
+                messageHash.recover(sigs[1]) == BETTOR2(),
+                "Timeout: bettors only"
+            );
+        }
+
+        tokenWithdrawn[token] = true;
+        nonce++;
+
+        uint256 bal = IERC20(token).balanceOf(address(this));
+        if (bal > 0) {
+            IERC20(token).safeTransfer(winner, bal);
+            emit TokenWithdrawn(token, winner, bal);
+        }
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        WITHDRAW ETH
+    //////////////////////////////////////////////////////////////*/
+
+    function withdrawETH(
+        address winner,
+        bytes[] calldata sigs
+    ) external notPaused {
+        require(block.timestamp >= LOCK_UNTIL, "Locked");
+        require(!ethWithdrawn, "ETH withdrawn");
+        require(winner == BETTOR1() || winner == BETTOR2(), "Invalid winner");
+
+        bytes32 messageHash = keccak256(
+            abi.encode(
+                "withdrawETH",
+                winner,
+                address(this),
+                block.chainid,
+                nonce
+            )
+        ).toEthSignedMessageHash();
+
+        uint256 valid = _countValidSigners(messageHash, sigs);
+
+        if (block.timestamp <= LOCK_UNTIL + JUDGE_TIMEOUT) {
+            require(valid >= 2, "Need 2 of 3");
+        } else {
+            require(
+                messageHash.recover(sigs[0]) == BETTOR1() &&
+                messageHash.recover(sigs[1]) == BETTOR2(),
+                "Timeout: bettors only"
+            );
+        }
+
+        ethWithdrawn = true;
+        nonce++;
+
+        uint256 bal = address(this).balance;
+        require(bal > 0, "No ETH");
+
+        (bool ok, ) = payable(winner).call{value: bal}("");
+        require(ok, "ETH transfer failed");
+
+        emit ETHWithdrawn(winner, bal);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        SAFETY WITHDRAWAL
+    //////////////////////////////////////////////////////////////*/
+
+    function safetyWithdrawal() external notPaused {
+        require(block.timestamp >= SAFETY_WITHDRAWAL_DATE, "Too early");
+
+        // ERC-20 tokens
+        for (uint256 i; i < tokenList.length; i++) {
+            address token = tokenList[i];
+            if (!tokenWithdrawn[token]) {
+                tokenWithdrawn[token] = true;
+                uint256 bal = IERC20(token).balanceOf(address(this));
+                if (bal > 0) {
+                    uint256 half = bal / 2;
+                    IERC20(token).safeTransfer(BETTOR1(), half);
+                    IERC20(token).safeTransfer(BETTOR2(), bal - half);
+                }
+            }
+        }
+
+        // ETH
+        if (!ethWithdrawn && address(this).balance > 0) {
+            ethWithdrawn = true;
+            uint256 half = address(this).balance / 2;
+            payable(BETTOR1()).call{value: half}("");
+            payable(BETTOR2()).call{value: address(this).balance}("");
+        }
+
+        emit SafetyWithdrawalExecuted();
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                          VIEW HELPERS
+    //////////////////////////////////////////////////////////////*/
+
+    function getAllTokens() external view returns (address[] memory) {
+        return tokenList;
+    }
+}
