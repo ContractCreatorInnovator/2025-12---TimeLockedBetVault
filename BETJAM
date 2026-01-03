@@ -39,7 +39,9 @@ contract TimeLockedBetVaultETH {
     bool public ethWithdrawn;
     bool public paused;
     bool public hasDeposits;
-    uint256 public nonce;
+
+    uint256 public pauseNonce;
+    uint256 public withdrawNonce;
 
     /*//////////////////////////////////////////////////////////////
                               EVENTS
@@ -67,6 +69,16 @@ contract TimeLockedBetVaultETH {
         _;
     }
 
+    modifier onlyParticipant() {
+        require(
+            msg.sender == BETTOR1() ||
+            msg.sender == BETTOR2() ||
+            msg.sender == JUDGE(),
+            "Not authorized"
+        );
+        _;
+    }
+
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
@@ -81,22 +93,17 @@ contract TimeLockedBetVaultETH {
                           ADMIN / SAFETY
     //////////////////////////////////////////////////////////////*/
 
-function pauseWithSignatures(bool _paused, bytes[] calldata sigs) external {
-    bytes32 messageHash = keccak256(
-        abi.encode("pause", _paused, address(this), block.chainid, nonce)
-    ).toEthSignedMessageHash();
+    function pauseWithSignatures(bool _paused, bytes[] calldata sigs) external {
+        bytes32 messageHash = keccak256(
+            abi.encode("pause", _paused, address(this), block.chainid, pauseNonce)
+        ).toEthSignedMessageHash();
 
-    uint256 valid = _countValidSigners(messageHash, sigs);
-    require(valid >= 2, "Need 2 of 3 signatures");
+        uint256 valid = _countValidSigners(messageHash, sigs);
+        require(valid >= 2, "Need 2 of 3 signatures");
 
-    paused = _paused;
-    nonce++;
-    emit Paused(_paused);
-}
-
-    function cancelIfUnfunded() external onlyBettor {
-        require(!hasDeposits, "Already funded");
-        selfdestruct(payable(msg.sender));
+        paused = _paused;
+        pauseNonce++;
+        emit Paused(_paused);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -159,6 +166,35 @@ function pauseWithSignatures(bool _paused, bytes[] calldata sigs) external {
     }
 
     /*//////////////////////////////////////////////////////////////
+                        INTERNAL SPLIT HELPERS
+    //////////////////////////////////////////////////////////////*/
+
+    function _splitToken(address token) internal {
+        uint256 bal = IERC20(token).balanceOf(address(this));
+        if (bal > 0) {
+            uint256 half = bal / 2;
+            IERC20(token).safeTransfer(BETTOR1(), half);
+            IERC20(token).safeTransfer(BETTOR2(), bal - half);
+        }
+        tokenWithdrawn[token] = true;
+        withdrawNonce++;
+        emit TokenWithdrawn(token, address(0), bal);
+    }
+
+    function _splitETH() internal {
+        uint256 bal = address(this).balance;
+        require(bal > 0, "No ETH");
+
+        uint256 half = bal / 2;
+        payable(BETTOR1()).call{value: half}("");
+        payable(BETTOR2()).call{value: bal - half}("");
+
+        ethWithdrawn = true;
+        withdrawNonce++;
+        emit ETHWithdrawn(address(0), bal);
+    }
+
+    /*//////////////////////////////////////////////////////////////
                         WITHDRAW TOKEN
     //////////////////////////////////////////////////////////////*/
 
@@ -170,6 +206,12 @@ function pauseWithSignatures(bool _paused, bytes[] calldata sigs) external {
         require(block.timestamp >= LOCK_UNTIL, "Locked");
         require(tokenRegistered[token], "Unknown token");
         require(!tokenWithdrawn[token], "Already withdrawn");
+
+        if (block.timestamp >= SAFETY_WITHDRAWAL_DATE) {
+            _splitToken(token);
+            return;
+        }
+
         require(winner == BETTOR1() || winner == BETTOR2(), "Invalid winner");
 
         bytes32 messageHash = keccak256(
@@ -179,32 +221,21 @@ function pauseWithSignatures(bool _paused, bytes[] calldata sigs) external {
                 winner,
                 address(this),
                 block.chainid,
-                nonce
+                withdrawNonce
             )
         ).toEthSignedMessageHash();
 
         uint256 valid = _countValidSigners(messageHash, sigs);
-
-        if(block.timestamp < SAFETY_WITHDRAWAL_DATE) {
-            // Perioden 01.01.2027 til 01.01.2028: dommer + én spiller
-            require(valid >= 2, "Need 2-of-3 approval");
-        } else {
-            // Etter 01.01.2028: spillerne kan hente 50/50 uavhengig av dommer
-            require(
-                messageHash.recover(sigs[0]) == BETTOR1() &&
-                messageHash.recover(sigs[1]) == BETTOR2(),
-                "After safety: bettors only"
-            );
-        }
-
-        tokenWithdrawn[token] = true;
-        nonce++;
+        require(valid >= 2, "Need 2-of-3 approval");
 
         uint256 bal = IERC20(token).balanceOf(address(this));
         if (bal > 0) {
             IERC20(token).safeTransfer(winner, bal);
-            emit TokenWithdrawn(token, winner, bal);
         }
+        tokenWithdrawn[token] = true;
+        withdrawNonce++;
+
+        emit TokenWithdrawn(token, winner, bal);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -217,6 +248,12 @@ function pauseWithSignatures(bool _paused, bytes[] calldata sigs) external {
     ) external notPaused {
         require(block.timestamp >= LOCK_UNTIL, "Locked");
         require(!ethWithdrawn, "ETH withdrawn");
+
+        if (block.timestamp >= SAFETY_WITHDRAWAL_DATE) {
+            _splitETH();
+            return;
+        }
+
         require(winner == BETTOR1() || winner == BETTOR2(), "Invalid winner");
 
         bytes32 messageHash = keccak256(
@@ -225,26 +262,15 @@ function pauseWithSignatures(bool _paused, bytes[] calldata sigs) external {
                 winner,
                 address(this),
                 block.chainid,
-                nonce
+                withdrawNonce
             )
         ).toEthSignedMessageHash();
 
         uint256 valid = _countValidSigners(messageHash, sigs);
-
-        if(block.timestamp < SAFETY_WITHDRAWAL_DATE) {
-            // Perioden 01.01.2027 til 01.01.2028: dommer + én spiller
-            require(valid >= 2, "Need 2-of-3 approval");
-        } else {
-            // Etter 01.01.2028: spillerne kan hente 50/50 uavhengig av dommer
-            require(
-                messageHash.recover(sigs[0]) == BETTOR1() &&
-                messageHash.recover(sigs[1]) == BETTOR2(),
-                "After safety: bettors only"
-            );
-        }
+        require(valid >= 2, "Need 2-of-3 approval");
 
         ethWithdrawn = true;
-        nonce++;
+        withdrawNonce++;
 
         uint256 bal = address(this).balance;
         require(bal > 0, "No ETH");
@@ -259,29 +285,27 @@ function pauseWithSignatures(bool _paused, bytes[] calldata sigs) external {
                         SAFETY WITHDRAWAL
     //////////////////////////////////////////////////////////////*/
 
-    function safetyWithdrawal() external notPaused {
+    function safetyWithdrawal() external notPaused onlyParticipant {
         require(block.timestamp >= SAFETY_WITHDRAWAL_DATE, "Too early");
 
-        // ERC-20 tokens
         for (uint256 i; i < tokenList.length; i++) {
             address token = tokenList[i];
             if (!tokenWithdrawn[token]) {
-                tokenWithdrawn[token] = true;
                 uint256 bal = IERC20(token).balanceOf(address(this));
                 if (bal > 0) {
                     uint256 half = bal / 2;
                     IERC20(token).safeTransfer(BETTOR1(), half);
                     IERC20(token).safeTransfer(BETTOR2(), bal - half);
                 }
+                tokenWithdrawn[token] = true;
             }
         }
 
-        // ETH
         if (!ethWithdrawn && address(this).balance > 0) {
-            ethWithdrawn = true;
             uint256 half = address(this).balance / 2;
             payable(BETTOR1()).call{value: half}("");
             payable(BETTOR2()).call{value: address(this).balance}("");
+            ethWithdrawn = true;
         }
 
         emit SafetyWithdrawalExecuted();
