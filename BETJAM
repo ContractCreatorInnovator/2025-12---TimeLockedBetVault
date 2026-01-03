@@ -1,21 +1,24 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.25;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
 contract TimeLockedBetVaultETH {
     using SafeERC20 for IERC20;
     using ECDSA for bytes32;
+    using MessageHashUtils for bytes32;
+
 
     /*//////////////////////////////////////////////////////////////
                               ROLES
     //////////////////////////////////////////////////////////////*/
 
-    address internal constant _BETTOR1 = 0x5df1b9398857148106bb27abd3ab1a30ba298449;
-    address internal constant _BETTOR2 = 0x99f2aafb4e43efa5d42fa2e44e3791c4d2005770;
-    address internal constant _JUDGE   = 0x7dd7624608445744de04db07ed6761346a281b3e;
+    address internal constant _BETTOR1 = 0x5Df1B9398857148106bb27ABd3ab1a30BA298449;
+    address internal constant _BETTOR2 = 0x99f2AaFB4E43eFA5d42fa2E44e3791c4d2005770;
+    address internal constant _JUDGE = 0x7dD7624608445744DE04DB07ed6761346a281b3e;
 
     function BETTOR1() public pure returns (address) { return _BETTOR1; }
     function BETTOR2() public pure returns (address) { return _BETTOR2; }
